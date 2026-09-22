@@ -1,0 +1,17 @@
+﻿# Build output
+**/bin/
+**/obj/
+/app/
+
+# Machine-specific files
+*.lnk
+.vs/
+*.user
+*.suo
+settings.json
+.env
+.env.*
+
+# Local diagnostics and real account usage
+/artifacts/*.json
+*.log
