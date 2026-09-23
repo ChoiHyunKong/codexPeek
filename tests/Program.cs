@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using CodexPeek;
 
 if (args.FirstOrDefault() == "app-server")
@@ -44,7 +44,7 @@ Check(schedule.LastSuccess == t.AddMinutes(10) && schedule.NextAttempt == t.AddM
 schedule.Configure(1, t.AddMinutes(12)); Check(schedule.IsDue(t.AddMinutes(12)), "shortened interval becomes immediately due");
 schedule.Configure(9999, t); Check(schedule.IntervalMinutes == 1440, "interval upper bound");
 var settings = new UserSettings { IntervalMinutes = 0, Transparency = 999, Width = double.NaN, Height = 1 };
-settings.Normalize(); Check(settings.IntervalMinutes == 1 && settings.Transparency == 80 && settings.Width == 270 && settings.Height == 130, "settings normalization");
+settings.Normalize(); Check(settings.IntervalMinutes == 1 && settings.Transparency == 80 && settings.Width == 270 && settings.Height == 80, "settings normalization");
 var roundtrip = JsonSerializer.Deserialize<UserSettings>(JsonSerializer.Serialize(new UserSettings { Width=345, Height=222, Pinned=true, Transparency=60, IntervalMinutes=17 }));
 Check(roundtrip is { Width:345, Height:222, Pinned:true, Transparency:60, IntervalMinutes:17 }, "settings persistence payload");
 var executable = Environment.ProcessPath!;

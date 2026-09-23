@@ -89,7 +89,7 @@ public sealed class UserSettings
         IntervalMinutes = Math.Clamp(IntervalMinutes, 1, 1440);
         Transparency = Math.Clamp(Transparency, 0, 80);
         Width = double.IsFinite(Width) ? Math.Clamp(Width, 220, 2000) : 270;
-        Height = double.IsFinite(Height) ? Math.Clamp(Height, 130, 1600) : 160;
+        Height = double.IsFinite(Height) ? Math.Clamp(Height, 80, 1600) : 160;
         if (Left is double x && !double.IsFinite(x)) Left = null;
         if (Top is double y && !double.IsFinite(y)) Top = null;
     }

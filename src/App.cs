@@ -67,6 +67,8 @@ public sealed class WidgetWindow : Window
     private readonly RowDefinition quotaRow = new() { Height = new GridLength(1, GridUnitType.Star) };
     private readonly ScrollViewer scroller;
     private double contentScale = 1;
+    private bool fittingCompactHeight;
+    private bool hasRenderedSnapshot;
     private double ExpandedScale() => Math.Clamp(Math.Min(ActualWidth / 340.0, ActualHeight / 260.0), 1, 2.5);
     private readonly RowDefinition footerRow = new() { Height = new GridLength(20) };
     private readonly TextBlock state;
@@ -94,7 +96,7 @@ public sealed class WidgetWindow : Window
         Title = "Codex Peek";
         FontFamily = new FontFamily("Segoe UI, Malgun Gothic");
         FontSize = 12; Foreground = new SolidColorBrush(Ink);
-        Width = settings.Width; Height = settings.Height; MinWidth = 220; MinHeight = 130;
+        Width = settings.Width; Height = settings.Height; MinWidth = 220; MinHeight = 80;
         WindowStyle = WindowStyle.None; AllowsTransparency = true; Background = Brushes.Transparent;
         ResizeMode = ResizeMode.CanResize; ShowInTaskbar = false; Topmost = settings.Pinned;
         WindowStartupLocation = WindowStartupLocation.Manual;
@@ -242,6 +244,8 @@ public sealed class WidgetWindow : Window
     }
     private void RenderSnapshot(UsageSnapshot data)
     {
+        bool fitRestoredMinimum = !hasRenderedSnapshot && ActualHeight <= 130;
+        hasRenderedSnapshot = true;
         rows.Children.Clear(); resetLabels.Clear(); layoutMode = SelectLayout();
         contentScale = expandedMode ? ExpandedScale() : 1;
         brandLabel.FontSize = expandedMode ? 14 * contentScale : 13;
@@ -282,6 +286,7 @@ public sealed class WidgetWindow : Window
         }
         if (!hadError) footer.ToolTip = null;
         UpdateTimeLabels();
+        if (fitRestoredMinimum && compactMode) Height = MinHeight;
     }
     private void UpdateFooterVisibility()
     {
@@ -300,6 +305,22 @@ public sealed class WidgetWindow : Window
             scroller.MaxHeight = Math.Max(35, ActualHeight - 19 - headerRow.Height.Value - footer.DesiredSize.Height - 4);
         }
         else scroller.MaxHeight = double.PositiveInfinity;
+        UpdateCompactMinimum();
+    }
+    private void UpdateCompactMinimum()
+    {
+        if (!compactMode || fittingCompactHeight || snapshot is null || !rows.Children.OfType<Grid>().Any()) return;
+        fittingCompactHeight = true;
+        try
+        {
+            bool wasAtMinimum = Height <= MinHeight + 0.5;
+            rows.Measure(new Size(Math.Max(1, ActualWidth - 28), double.PositiveInfinity));
+            double required = Math.Ceiling(rows.DesiredSize.Height + 19 + headerRow.Height.Value + 4 + footerRow.Height.Value);
+            // More than two quotas may scroll; compact layout remains below its 150-DIP boundary.
+            MinHeight = Math.Clamp(required, 80, 149);
+            if (wasAtMinimum) Height = MinHeight;
+        }
+        finally { fittingCompactHeight = false; }
     }
     private void UpdateTimeLabels()
     {
@@ -379,7 +400,7 @@ public sealed class WidgetWindow : Window
             Width = width; Height = height;
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle);
             UpdateLayout();
-            var bitmap = new RenderTargetBitmap((int)width * 2, (int)height * 2, 192, 192, PixelFormats.Pbgra32);
+            var bitmap = new RenderTargetBitmap((int)Math.Ceiling(ActualWidth * 2), (int)Math.Ceiling(ActualHeight * 2), 192, 192, PixelFormats.Pbgra32);
             bitmap.Render((Visual)Content); var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(bitmap));
             using var stream = File.Create(System.IO.Path.Combine(folder, name + ".png")); encoder.Save(stream); rendered++;
         }
@@ -409,7 +430,14 @@ public sealed class WidgetWindow : Window
             }
         }
         await Capture("default-demo", 270, 160); CheckQuotaLayout(WidgetLayout.Standard);
-        await Capture("minimum-demo", 220, 130); CheckQuotaLayout(WidgetLayout.Compact);
+        await Capture("minimum-demo", 220, 80); CheckQuotaLayout(WidgetLayout.Compact);
+        void CheckBottomPadding()
+        {
+            var last = resetLabels.Last().Text;
+            double bottom = last.TranslatePoint(new Point(0, last.ActualHeight), this).Y;
+            if (ActualHeight - bottom > 12) throw new Exception($"Minimum widget has excess bottom padding: {ActualHeight - bottom}");
+        }
+        CheckBottomPadding();
         await Capture("threshold-compact-demo", 270, 149); CheckQuotaLayout(WidgetLayout.Compact);
         await Capture("threshold-full-demo", 270, 150); CheckQuotaLayout(WidgetLayout.Standard);
         await Capture("expanded-demo", 380, 300); CheckQuotaLayout(WidgetLayout.Expanded);
@@ -428,6 +456,12 @@ public sealed class WidgetWindow : Window
         RenderSnapshot(snapshot);
         await Capture("weekly-only-demo", 270, 160); CheckQuotaLayout(WidgetLayout.Standard);
         if (rows.Children.OfType<Grid>().Count() != 1) throw new Exception("Missing daily quota must not be fabricated");
+        await Capture("weekly-minimum-demo", 220, 80); CheckQuotaLayout(WidgetLayout.Compact); CheckBottomPadding();
+        double normalMinimum = MinHeight;
+        busy = true; UpdateTimeLabels(); UpdateLayout();
+        if (Height <= normalMinimum) throw new Exception("Compact loading status did not receive space");
+        busy = false; UpdateTimeLabels(); UpdateLayout();
+        if (Math.Abs(Height - normalMinimum) > 0.5) throw new Exception("Compact height did not recover after loading");
         await Capture("weekly-expanded-demo", 380, 300); CheckQuotaLayout(WidgetLayout.Expanded);
         snapshot = snapshot with { Windows = new List<LimitWindow> { new("일간 한도", 28, now.AddHours(2).AddMinutes(18).ToUnixTimeSeconds()), new("주간 한도", 31, now.AddDays(5).AddHours(2).AddSeconds(30).ToUnixTimeSeconds()) } };
         RenderSnapshot(snapshot);
@@ -436,7 +470,7 @@ public sealed class WidgetWindow : Window
         ApplyTransparency(80);
         if (((SolidColorBrush)surface.Background).Color.A != 51) throw new Exception("Opacity mismatch");
         await Capture("expanded-transparent-demo", 380, 300); CheckQuotaLayout(WidgetLayout.Expanded);
-        File.WriteAllText(System.IO.Path.Combine(folder, "ui-check.json"), JsonSerializer.Serialize(new { pinToggle = true, transparency80 = true, sizesRendered = rendered, essentialLabelsAlwaysVisible = true, expandedDetails = true, staleDataStatus = true, singleQuotaSupported = true, proportionalTypography = true, groupedStatus = true }));
+        File.WriteAllText(System.IO.Path.Combine(folder, "ui-check.json"), JsonSerializer.Serialize(new { pinToggle = true, transparency80 = true, sizesRendered = rendered, essentialLabelsAlwaysVisible = true, expandedDetails = true, staleDataStatus = true, singleQuotaSupported = true, proportionalTypography = true, groupedStatus = true, compactHeightFitsContent = true }));
         Close();
     }
     [StructLayout(LayoutKind.Sequential)] private struct RECT { public int Left, Top, Right, Bottom; }
