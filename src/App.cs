@@ -26,10 +26,22 @@ public sealed class App : Application
     private Mutex? mutex;
     [STAThread] public static void Main(string[] args)
     {
-        if (args.Length > 0 && args[0] == "--claude-statusline")
+        if (args.Length > 0 && (args[0] == "--claude-statusline" || args[0] == "--verify-claude-bridge"))
         {
-            try { ClaudeBridge.Capture(Console.In.ReadToEnd()); Console.WriteLine("Claude · Codex Peek 연결됨"); }
-            catch { Console.WriteLine("Claude · 한도 전달 대기"); }
+            bool probe = args[0] == "--verify-claude-bridge";
+            try
+            {
+                // Native status-line input is UTF-8. Console.In may use the Korean OEM code page.
+                using var input = new StreamReader(Console.OpenStandardInput(), new System.Text.UTF8Encoding(false, true), true);
+                ClaudeBridge.Capture(input.ReadToEnd(), probe ? args[1] : null);
+                Console.WriteLine("Claude: connected");
+            }
+            catch (Exception ex)
+            {
+                if (!probe) ClaudeBridge.ReportFailure(ex.GetType().Name);
+                Console.WriteLine("Claude: input failed; check Codex Peek");
+                Environment.ExitCode = 1;
+            }
             return;
         }
         if (args.Length > 0 && args[0] == "--probe")
@@ -120,8 +132,8 @@ public sealed partial class WidgetWindow : Window
         layout.RowDefinitions.Add(quotaRow);
         layout.RowDefinitions.Add(footerRow);
         layout.RowDefinitions.Add(serviceRow);
-        serviceScroll.Content = services;
-        Grid.SetRow(serviceScroll, 3); layout.Children.Add(serviceScroll);
+        InitializeServices();
+        Grid.SetRow(serviceHost, 3); layout.Children.Add(serviceHost);
 
         var header = new Grid { Background = Brushes.Transparent };
         header.ColumnDefinitions.Add(new ColumnDefinition()); header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -148,6 +160,7 @@ public sealed partial class WidgetWindow : Window
         footer.VerticalAlignment = VerticalAlignment.Bottom; footer.TextTrimming = TextTrimming.CharacterEllipsis;
         Grid.SetRow(footer, 2); layout.Children.Add(footer);
         AddResizeHandles(root);
+        SourceInitialized += (_, _) => AttachWorkAreaGuard();
         UpdatePin();
 
         if (verifyFolder is null)
@@ -169,6 +182,7 @@ public sealed partial class WidgetWindow : Window
         timer.Tick += async (_, _) =>
         {
             UpdateTimeLabels();
+            CheckClaudeBridge();
             if (DateTimeOffset.Now >= nextServicesUpdate) _ = RefreshServicesAsync();
             if (schedule.IsDue(DateTimeOffset.Now)) await RefreshAsync();
         };
@@ -192,6 +206,8 @@ public sealed partial class WidgetWindow : Window
                 }
                 return;
             }
+            try { ClaudeBridge.UpgradeOwnedConnection(Environment.ProcessPath!); }
+            catch { ClaudeBridge.ReportFailure("ConnectionUpgradeFailed"); }
             RenderSnapshot(snapshot); timer.Start(); await RefreshAsync();
         };
         Closed += (_, _) =>
@@ -223,6 +239,7 @@ public sealed partial class WidgetWindow : Window
     private void ShowWidget() { Show(); WindowState = WindowState.Normal; EnsureVisible(); Activate(); }
     private void EnsureVisible()
     {
+        ClampToWorkArea();
         var handle = new WindowInteropHelper(this).Handle;
         if (handle != IntPtr.Zero && GetWindowRect(handle, out var rect))
         {
@@ -315,6 +332,13 @@ public sealed partial class WidgetWindow : Window
     }
     private void UpdateFooterVisibility()
     {
+        if (dashboardCodexStatus is not null) dashboardCodexStatus.Text = footer.Text;
+        scroller.Visibility = dashboardMode ? Visibility.Collapsed : Visibility.Visible;
+        if (dashboardMode)
+        {
+            quotaRow.Height = new GridLength(0); footerRow.Height = new GridLength(0); footer.Visibility = Visibility.Collapsed;
+            return;
+        }
         bool show = !compactMode || hadError || busy;
         footer.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
         footer.FontSize = expandedMode ? 12 * contentScale : 9;
@@ -435,6 +459,13 @@ public sealed partial class WidgetWindow : Window
             Width = width; Height = height;
             await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle);
             UpdateLayout();
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle);
+            UpdateLayout();
+            if (dashboardMode)
+            {
+                var navigationTitle = serviceToolbar.Children.OfType<Grid>().First().Children.OfType<Label>().Single();
+                if (!navigationTitle.IsVisible || navigationTitle.ActualWidth < 20 || navigationTitle.ActualHeight < 10) throw new Exception("Card navigation title was clipped");
+            }
             var bitmap = new RenderTargetBitmap((int)Math.Ceiling(ActualWidth * 2), (int)Math.Ceiling(ActualHeight * 2), 192, 192, PixelFormats.Pbgra32);
             bitmap.Render((Visual)Content); var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(bitmap));
             using var stream = File.Create(System.IO.Path.Combine(folder, name + ".png")); encoder.Save(stream); rendered++;
@@ -442,6 +473,13 @@ public sealed partial class WidgetWindow : Window
         void CheckQuotaLayout(WidgetLayout expected)
         {
             if (layoutMode != expected) throw new Exception("Wrong responsive layout");
+            if (dashboardMode)
+            {
+                if (scroller.IsVisible || footer.IsVisible || !serviceHost.IsVisible) throw new Exception("Dashboard must replace fixed Codex rows");
+                if (serviceScroll.ViewportHeight < 100 || serviceScroll.ScrollableWidth > 0) throw new Exception("Dashboard viewport is not usable");
+                if (services.Children.Count != (settings.ServiceCarousel ? 1 : 3)) throw new Exception("Wrong number of visible cards");
+                return;
+            }
             foreach (var box in rows.Children.OfType<Grid>())
             {
                 var bar = box.Children.OfType<Grid>().Single(g => g.Name == "QuotaBar");
@@ -478,16 +516,37 @@ public sealed partial class WidgetWindow : Window
         await Capture("expanded-demo", 380, 300); CheckQuotaLayout(WidgetLayout.Expanded);
         await Capture("expanded-boundary-demo", 340, 260); CheckQuotaLayout(WidgetLayout.Expanded);
         await Capture("large-demo", 640, 480); CheckQuotaLayout(WidgetLayout.Expanded);
-        if (footer.FontSize < 16) throw new Exception("Text did not scale with the window");
+        if (brandLabel.FontSize < 18) throw new Exception("Text did not scale with the window");
         await Capture("extra-large-demo", 900, 620); CheckQuotaLayout(WidgetLayout.Expanded);
         await Capture("narrow-tall-demo", 220, 300); CheckQuotaLayout(WidgetLayout.Expanded);
         await Capture("narrow-dashboard-demo", 220, 650); CheckQuotaLayout(WidgetLayout.Expanded);
-        if (!serviceScroll.IsVisible || serviceScroll.ViewportHeight < 100 || services.Children.Count < 3) throw new Exception("Narrow dashboard missing service cards");
+        if (!serviceScroll.IsVisible || serviceScroll.ViewportHeight < 100 || services.Children.Count != 1) throw new Exception("Narrow dashboard missing selected card");
         if (serviceScroll.ScrollableWidth > 0) throw new Exception("Service cards overflow horizontally");
+        void ClickService(string name) => serviceToolbar.Children.OfType<Grid>().SelectMany(g => g.Children.OfType<Button>())
+            .Single(b => System.Windows.Automation.AutomationProperties.GetName(b) == name).RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+        ClickService("다음 서비스");
+        if (settings.SelectedService != "gmail" || (string)((Border)services.Children[0]).Tag != "gmail") throw new Exception("Next button did not select Gmail");
+        await Capture("carousel-gmail-demo", 220, 420);
+        ClickService("다음 서비스"); await Capture("carousel-claude-waiting-demo", 220, 420);
+        ClickService("선택한 카드를 앞 순서로 이동"); ClickService("선택한 카드를 앞 순서로 이동");
+        if (settings.ServiceOrder[0] != "claude" || settings.SelectedService != "claude") throw new Exception("Card reordering lost selection");
+        ClickService("이전 서비스");
+        if (settings.SelectedService != "gmail") throw new Exception("Previous navigation did not wrap");
+        ClickService("다음 서비스");
+        var restored = JsonSerializer.Deserialize<UserSettings>(JsonSerializer.Serialize(settings))!;
+        if (restored.SelectedService != "claude" || restored.ServiceOrder[0] != "claude" || !restored.ServiceCarousel) throw new Exception("Card preferences not persistent");
+        ClickService("가로 넘김 / 세로 모두 보기");
+        if (services.Children.Count != 3 || (string)((Border)services.Children[0]).Tag != "claude") throw new Exception("Stacked cards ignored chosen order");
+        await Capture("reordered-stack-demo", 220, 650);
+        settings.ServiceOrder = new() { "codex", "gmail", "claude" }; settings.SelectedService = "codex";
+        RenderServiceCards();
         serviceScroll.ScrollToBottom(); await Capture("narrow-dashboard-bottom-demo", 220, 650); serviceScroll.ScrollToTop();
         mail = new MailSnapshot("demo@example.com", 12, new() { new("이번 주 프로젝트 진행 상황 공유", "디자인 팀"), new("회의 일정 확인", "프로젝트 팀"), new("새로운 업데이트 안내", "서비스 안내") }, now);
         claude = new ClaudeSnapshot(new() { new("5시간 한도", 20, now.AddHours(3).ToUnixTimeSeconds()), new("주간 한도", 45, now.AddDays(4).ToUnixTimeSeconds()) }, now);
         RenderServiceCards(); await Capture("connected-dashboard-demo", 380, 760);
+        settings.SelectedService = "claude"; settings.ServiceCarousel = true; RenderServiceCards();
+        await Capture("carousel-claude-demo", 220, 420);
+        settings.ServiceCarousel = false; RenderServiceCards();
         serviceScroll.ScrollToBottom(); await Capture("connected-dashboard-bottom-demo", 220, 650); serviceScroll.ScrollToTop();
         await Capture("dashboard-boundary-demo", 220, 360);
         if (!serviceScroll.IsVisible || serviceScroll.ViewportHeight < 100 || serviceScroll.ScrollableWidth > 0) throw new Exception("Dashboard threshold lost accessible cards");
@@ -544,7 +603,9 @@ public sealed partial class WidgetWindow : Window
         var connectionEncoder = new PngBitmapEncoder(); connectionEncoder.Frames.Add(BitmapFrame.Create(connectionBitmap));
         using (var output = File.Create(System.IO.Path.Combine(folder, "connections-demo.png"))) connectionEncoder.Save(output);
         connectionsWindow.Close();
-        File.WriteAllText(System.IO.Path.Combine(folder, "ui-check.json"), JsonSerializer.Serialize(new { pinToggle = true, transparency80 = true, sizesRendered = rendered, essentialLabelsAlwaysVisible = true, expandedDetails = true, staleDataStatus = true, singleQuotaSupported = true, proportionalTypography = true, groupedStatus = true, compactHeightFitsContent = true, helpWindow = true, helpTopicsRendered = 3, narrowDashboard = true, independentServiceVisibility = true, connectionsWindow = true }));
+        if (serviceToolbar.Children.OfType<Grid>().SelectMany(g => g.Children.OfType<Button>()).Any(b => b.Content?.ToString()?.Contains("연결") == true)) throw new Exception("Main widget still contains connection button");
+        await VerifyWorkAreaAsync();
+        File.WriteAllText(System.IO.Path.Combine(folder, "ui-check.json"), JsonSerializer.Serialize(new { pinToggle = true, transparency80 = true, sizesRendered = rendered, essentialLabelsAlwaysVisible = true, expandedDetails = true, staleDataStatus = true, singleQuotaSupported = true, proportionalTypography = true, groupedStatus = true, compactHeightFitsContent = true, helpWindow = true, helpTopicsRendered = 3, narrowDashboard = true, independentServiceVisibility = true, connectionsWindow = true, carouselNavigation = true, cardReordering = true, cardPreferencesPersistence = true, taskbarGuard = true, mainConnectionButtonRemoved = true }));
         Close();
     }
     [StructLayout(LayoutKind.Sequential)] private struct RECT { public int Left, Top, Right, Bottom; }

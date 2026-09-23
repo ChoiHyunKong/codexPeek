@@ -66,4 +66,5 @@ try
 }
 finally { Environment.SetEnvironmentVariable("CODEX_PEEK_TEST_MODE", null); }
 await ServiceTests.Run(Check);
+if (args.Length == 2 && args[0] == "--widget-exe") await ServiceTests.VerifyWidgetBridge(args[1], Check);
 Console.WriteLine($"All {passed} checks passed.");

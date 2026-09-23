@@ -19,7 +19,7 @@ public sealed class ConnectionsWindow : Window
         Content = new ScrollViewer { Content = panel, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
         void Text(string text, double size = 13) => panel.Children.Add(new TextBlock { Text = text, TextWrapping = TextWrapping.Wrap, FontSize = size, Margin = new Thickness(0, 6, 0, 10) });
         Text("필요한 정보를 한 창에", 22);
-        Text("높이를 360 이상으로 늘리면 Codex 아래에 이메일과 Claude가 표시됩니다. 연결은 이 PC에만 저장됩니다.");
+        Text("높이 360부터 Codex·Gmail·Claude 카드를 좌우로 넘겨 보거나 세로로 모아 볼 수 있습니다. 연결은 이 PC에만 저장됩니다.");
         var show = new CheckBox { Content = "확대 화면에 이메일 · Claude 카드 표시", IsChecked = settings.ShowServices, Margin = new Thickness(0, 5, 0, 10) };
         show.Click += (_, _) => { settings.ShowServices = show.IsChecked == true; changed(); }; panel.Children.Add(show);
         Text("Gmail", 18);

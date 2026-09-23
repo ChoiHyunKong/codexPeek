@@ -10,6 +10,18 @@ using System.Threading.Tasks;
 
 namespace CodexPeek;
 
+public readonly record struct DesktopRect(int X, int Y, int Width, int Height);
+public static class DesktopPlacement
+{
+    public static DesktopRect Fit(DesktopRect window, DesktopRect work)
+    {
+        int width = Math.Clamp(window.Width, 1, Math.Max(1, work.Width));
+        int height = Math.Clamp(window.Height, 1, Math.Max(1, work.Height));
+        return new(Math.Clamp(window.X, work.X, work.X + Math.Max(0, work.Width - width)),
+            Math.Clamp(window.Y, work.Y, work.Y + Math.Max(0, work.Height - height)), width, height);
+    }
+}
+
 public sealed record LimitWindow(string Name, double UsedPercent, long? ResetAt)
 {
     public double Remaining => Math.Clamp(100 - UsedPercent, 0, 100);
@@ -85,8 +97,14 @@ public sealed class UserSettings
     public bool StartWithWindows { get; set; }
     public string? CodexPath { get; set; }
     public bool ShowServices { get; set; } = true;
+    public List<string> ServiceOrder { get; set; } = new() { "codex", "gmail", "claude" };
+    public string SelectedService { get; set; } = "codex";
+    public bool ServiceCarousel { get; set; } = true;
     public void Normalize()
     {
+        var known = new[] { "codex", "gmail", "claude" };
+        ServiceOrder = (ServiceOrder ?? new()).Where(known.Contains).Distinct().Concat(known).Distinct().ToList();
+        if (!known.Contains(SelectedService)) SelectedService = "codex";
         IntervalMinutes = Math.Clamp(IntervalMinutes, 1, 1440);
         Transparency = Math.Clamp(Transparency, 0, 80);
         Width = double.IsFinite(Width) ? Math.Clamp(Width, 220, 2000) : 270;
