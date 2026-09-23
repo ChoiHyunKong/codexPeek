@@ -72,7 +72,13 @@ public sealed class WidgetWindow : Window
     private SettingsWindow? settingsWindow;
     private bool busy;
     private bool closed;
-    private bool hadError; private bool compactMode;
+    private bool hadError;
+    private enum WidgetLayout { Compact, Standard, Expanded }
+    private WidgetLayout layoutMode;
+    private bool compactMode => layoutMode == WidgetLayout.Compact;
+    private bool expandedMode => layoutMode == WidgetLayout.Expanded;
+    private WidgetLayout SelectLayout() => ActualWidth >= 340 && ActualHeight >= 260
+        ? WidgetLayout.Expanded : ActualHeight < 150 ? WidgetLayout.Compact : WidgetLayout.Standard;
     private readonly string? verifyFolder;
 
     public WidgetWindow(string? verifyFolder = null)
@@ -138,11 +144,20 @@ public sealed class WidgetWindow : Window
         }
         timer.Tick += async (_, _) => { UpdateTimeLabels(); if (schedule.IsDue(DateTimeOffset.Now)) await RefreshAsync(); };
         saveTimer.Tick += (_, _) => { saveTimer.Stop(); SaveSettings(); };
-        LocationChanged += (_, _) => QueueSave(); SizeChanged += (_, _) => { QueueSave(); if (snapshot is not null && compactMode != (ActualHeight < 150)) RenderSnapshot(snapshot); };
+        LocationChanged += (_, _) => QueueSave(); SizeChanged += (_, _) => { QueueSave(); if (snapshot is not null && layoutMode != SelectLayout()) RenderSnapshot(snapshot); };
         Loaded += async (_, _) =>
         {
             EnsureVisible();
-            if (verifyFolder is not null) { await VerifyUiAsync(verifyFolder); return; }
+            if (verifyFolder is not null)
+            {
+                try { await VerifyUiAsync(verifyFolder); }
+                catch (Exception ex)
+                {
+                    File.WriteAllText(System.IO.Path.Combine(verifyFolder, "ui-check.json"), JsonSerializer.Serialize(new { ok = false, error = ex.ToString() }));
+                    Environment.ExitCode = 1; Close();
+                }
+                return;
+            }
             timer.Start(); await RefreshAsync();
         };
         Closed += (_, _) =>
@@ -208,59 +223,76 @@ public sealed class WidgetWindow : Window
         }
         finally { busy = false; refreshButton.IsEnabled = true; if (!closed) UpdateTimeLabels(); }
     }
+    private static string AbsoluteReset(LimitWindow window)
+    {
+        if (window.ResetAt is not long epoch) return "정확한 리셋 시각 정보 없음";
+        try { return "리셋 " + DateTimeOffset.FromUnixTimeSeconds(epoch).ToLocalTime().ToString("yyyy.MM.dd (ddd) HH:mm", CultureInfo.GetCultureInfo("ko-KR")); }
+        catch (ArgumentOutOfRangeException) { return "정확한 리셋 시각 정보 없음"; }
+    }
     private void RenderSnapshot(UsageSnapshot data)
     {
-        rows.Children.Clear(); resetLabels.Clear(); compactMode = ActualHeight < 150;
+        rows.Children.Clear(); resetLabels.Clear(); layoutMode = SelectLayout();
         if (data.Windows.Count == 0) { state.Text = "계정에서 표시 가능한 한도 정보를 제공하지 않았습니다."; rows.Children.Add(state); }
         foreach (var w in data.Windows)
         {
-            var box = new Grid { Margin = new Thickness(0, compactMode ? 6 : 1, 2, compactMode ? 6 : 1) };
+            var box = new Grid { Margin = new Thickness(0, 1, 2, expandedMode ? 3 : 1) };
             box.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            box.RowDefinitions.Add(new RowDefinition { Height = new GridLength(compactMode ? 10 : 7) });
+            box.RowDefinitions.Add(new RowDefinition { Height = new GridLength(expandedMode ? 10 : 7) });
             box.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-            var title = new Grid { Name = "QuotaHeading", Visibility = compactMode ? Visibility.Collapsed : Visibility.Visible };
+            box.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            // The heading, countdown, remaining percentage and bar are essential at every size.
+            var title = new Grid { Name = "QuotaHeading" };
             title.ColumnDefinitions.Add(new ColumnDefinition()); title.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
-            var name = Label(w.Name, 11, Muted); name.TextTrimming = TextTrimming.CharacterEllipsis; name.ToolTip = w.Name;
-            var number = Label($"{w.Remaining:0.#}% 남음", 13, w.Remaining <= 10 ? Color.FromRgb(185, 78, 55) : Green, FontWeights.SemiBold);
+            var name = Label(w.Name, compactMode ? 10 : expandedMode ? 12 : 11, Muted);
+            name.TextTrimming = TextTrimming.CharacterEllipsis; name.ToolTip = w.Name;
+            var number = Label($"{w.Remaining:0.#}% 남음", compactMode ? 11 : expandedMode ? 15 : 13, w.Remaining <= 10 ? Color.FromRgb(185, 78, 55) : Green, FontWeights.SemiBold);
             number.Margin = new Thickness(6, 0, 0, 0); Grid.SetColumn(number, 1); title.Children.Add(name); title.Children.Add(number); box.Children.Add(title);
-            // Keep every quota bar visible at all supported window sizes.
             var track = new Grid { Name = "QuotaBar", Height = 6, VerticalAlignment = VerticalAlignment.Center, ClipToBounds = true, Background = Brushes.Transparent };
             System.Windows.Automation.AutomationProperties.SetName(track, $"{w.Name}, {w.Remaining:0.#}% 남음");
             track.ToolTip = "";
-            track.ToolTipOpening += (_, _) => track.ToolTip = $"{w.Name} · {w.Remaining:0.#}% 남음\n{w.ResetText(DateTimeOffset.Now)}\n최근 갱신 {data.FetchedAt:MM/dd HH:mm}";
+            track.ToolTipOpening += (_, _) => track.ToolTip = $"{w.Name} · {w.Remaining:0.#}% 남음\n{w.ResetText(DateTimeOffset.Now)}\n{AbsoluteReset(w)}\n최근 갱신 {data.FetchedAt:MM/dd HH:mm}";
             track.Children.Add(new Border { Background = new SolidColorBrush(Color.FromArgb(50, 82, 127, 106)), CornerRadius = new CornerRadius(3) });
             var fill = new Border { Background = new SolidColorBrush(w.Remaining <= 10 ? Color.FromRgb(185, 78, 55) : Green), CornerRadius = new CornerRadius(3), HorizontalAlignment = HorizontalAlignment.Left };
             track.SizeChanged += (_, _) => fill.Width = track.ActualWidth * w.Remaining / 100;
             track.Children.Add(fill); Grid.SetRow(track, 1); box.Children.Add(track);
-            var reset = Label(w.ResetText(DateTimeOffset.Now), 10, Muted);
-            reset.Name = "QuotaReset"; reset.Visibility = compactMode ? Visibility.Collapsed : Visibility.Visible;
-            reset.TextTrimming = TextTrimming.CharacterEllipsis;
-            if (w.ResetAt is long epoch) { try { reset.ToolTip = DateTimeOffset.FromUnixTimeSeconds(epoch).ToLocalTime().ToString("yyyy-MM-dd ddd HH:mm"); } catch { } }
-            Grid.SetRow(reset, 2); box.Children.Add(reset); resetLabels.Add((w, reset)); rows.Children.Add(box);
+            var reset = Label(w.ResetText(DateTimeOffset.Now), compactMode ? 9 : 10, Muted);
+            reset.Name = "QuotaReset"; reset.TextTrimming = TextTrimming.CharacterEllipsis; reset.ToolTip = AbsoluteReset(w);
+            Grid.SetRow(reset, 2); box.Children.Add(reset); resetLabels.Add((w, reset));
+            var detail = new StackPanel { Name = "QuotaDetails", Visibility = expandedMode ? Visibility.Visible : Visibility.Collapsed, Margin = new Thickness(0, 3, 0, 0) };
+            detail.Children.Add(Label($"사용한 비율 {100 - w.Remaining:0.#}%", 10, Muted));
+            detail.Children.Add(Label(AbsoluteReset(w), 10, Muted));
+            Grid.SetRow(detail, 3); box.Children.Add(detail); rows.Children.Add(box);
         }
         if (!hadError) footer.ToolTip = null;
-        UpdateFooterVisibility();
+        UpdateTimeLabels();
     }
     private void UpdateFooterVisibility()
     {
         bool show = !compactMode || hadError || busy;
         footer.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
-        footerRow.Height = new GridLength(show ? 20 : 0);
+        footer.FontSize = expandedMode ? 10 : 9;
+        footerRow.Height = new GridLength(show ? expandedMode ? 50 : 20 : 0);
     }
     private void UpdateTimeLabels()
     {
         var now = DateTimeOffset.Now;
         UpdateFooterVisibility();
         foreach (var (w, text) in resetLabels) text.Text = w.ResetText(now);
-        if (busy) return;
+        if (busy) { footer.Text = "최신 사용량을 조회하고 있습니다…"; return; }
         if (hadError)
         {
-            footer.Text = schedule.LastSuccess is { } last ? $"갱신 실패 · 최근 {last:MM/dd HH:mm} · ↻ 재시도" : "연결 실패 · ↻ 재시도 / ⚙ 설정";
+            footer.Text = schedule.LastSuccess is { } last
+                ? expandedMode ? $"갱신 실패 · 이전 조회 결과 표시 중\n최근 성공 {last:MM/dd HH:mm} · 재시도 {schedule.NextAttempt:MM/dd HH:mm}\n자동 갱신 {settings.IntervalMinutes}분 간격 · ↻ 즉시 재시도"
+                    : $"갱신 실패 · 최근 {last:MM/dd HH:mm} · ↻ 재시도"
+                : "연결 실패 · ↻ 재시도 / ⚙ 설정";
             footer.Foreground = new SolidColorBrush(Color.FromRgb(172, 87, 54));
         }
         else
         {
-            footer.Text = schedule.LastSuccess is { } last ? $"최근 {last:HH:mm}  ·  다음 {schedule.NextAttempt:HH:mm}" : "연결 준비 중";
+            footer.Text = schedule.LastSuccess is { } last
+                ? expandedMode ? $"조회 정상 · 자동 갱신 {settings.IntervalMinutes}분 간격\n최근 갱신 {last:MM/dd HH:mm:ss}\n다음 갱신 {schedule.NextAttempt:MM/dd HH:mm:ss}"
+                    : $"최근 {last:HH:mm}  ·  다음 {schedule.NextAttempt:HH:mm}"
+                : "연결 준비 중";
             footer.Foreground = new SolidColorBrush(Muted);
             footer.ToolTip = schedule.LastSuccess is { } time ? $"마지막 조회 성공: {time:yyyy-MM-dd HH:mm:ss}\n다음 조회: {schedule.NextAttempt:yyyy-MM-dd HH:mm:ss}" : null;
         }
@@ -311,48 +343,62 @@ public sealed class WidgetWindow : Window
     {
         Directory.CreateDirectory(folder);
         var now = DateTimeOffset.Now;
-        snapshot = new UsageSnapshot(new List<LimitWindow> { new("일간 한도", 28, now.AddHours(2).AddMinutes(18).ToUnixTimeSeconds()), new("주간 한도", 57, now.AddDays(3).AddHours(6).ToUnixTimeSeconds()) }, "demo", now);
-        schedule.Succeeded(now); RenderSnapshot(snapshot); UpdateTimeLabels();
+        snapshot = new UsageSnapshot(new List<LimitWindow> { new("일간 한도", 28, now.AddHours(2).AddMinutes(18).ToUnixTimeSeconds()), new("주간 한도", 31, now.AddDays(5).AddHours(2).AddSeconds(30).ToUnixTimeSeconds()) }, "demo", now);
+        schedule.Succeeded(now); RenderSnapshot(snapshot);
+        int rendered = 0;
         async Task Capture(string name, double width, double height)
         {
-            Width = width; Height = height; await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle);
+            Width = width; Height = height;
+            await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle);
             UpdateLayout();
             var bitmap = new RenderTargetBitmap((int)width * 2, (int)height * 2, 192, 192, PixelFormats.Pbgra32);
             bitmap.Render((Visual)Content); var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(bitmap));
-            using var stream = File.Create(System.IO.Path.Combine(folder, name + ".png")); encoder.Save(stream);
+            using var stream = File.Create(System.IO.Path.Combine(folder, name + ".png")); encoder.Save(stream); rendered++;
         }
-        void CheckQuotaLayout(bool compact)
+        void CheckQuotaLayout(WidgetLayout expected)
         {
+            if (layoutMode != expected) throw new Exception("Wrong responsive layout");
             foreach (var box in rows.Children.OfType<Grid>())
             {
                 var bar = box.Children.OfType<Grid>().Single(g => g.Name == "QuotaBar");
                 var heading = box.Children.OfType<Grid>().Single(g => g.Name == "QuotaHeading");
                 var reset = box.Children.OfType<TextBlock>().Single(t => t.Name == "QuotaReset");
+                var detail = box.Children.OfType<StackPanel>().Single(p => p.Name == "QuotaDetails");
                 if (!bar.IsVisible || bar.ActualHeight < 4 || bar.ActualWidth <= 0) throw new Exception("Quota bar disappeared");
-                if (heading.IsVisible == compact || reset.IsVisible == compact) throw new Exception("Incorrect responsive quota labels");
-                var bounds = bar.TranslatePoint(new Point(0, 0), rows);
+                if (!heading.IsVisible || !reset.IsVisible) throw new Exception("Essential quota labels disappeared");
+                if (detail.IsVisible != (expected == WidgetLayout.Expanded)) throw new Exception("Incorrect expanded details");
                 var viewport = (ScrollViewer)rows.Parent;
                 if (viewport.ScrollableHeight > 0.5) throw new Exception("Two quota rows should fit without scrolling");
-                if (bounds.Y + bar.ActualHeight > viewport.ViewportHeight) throw new Exception("Quota bar clipped by viewport");
+                var bounds = box.TranslatePoint(new Point(0, 0), rows);
+                if (bounds.Y + box.ActualHeight > viewport.ViewportHeight + 0.5) throw new Exception("Quota content clipped");
             }
-            if (footer.IsVisible == compact) throw new Exception("Incorrect compact footer");
+            if (footer.IsVisible != (expected != WidgetLayout.Compact)) throw new Exception("Incorrect footer visibility");
         }
-        await Capture("default-demo", 270, 160);
-        CheckQuotaLayout(false);
-        await Capture("minimum-demo", 220, 130);
-        CheckQuotaLayout(true);
-        await Capture("threshold-compact-demo", 270, 149);
-        CheckQuotaLayout(true);
-        await Capture("threshold-full-demo", 270, 150);
-        CheckQuotaLayout(false);
-        await Capture("restored-demo", 270, 160);
-        CheckQuotaLayout(false);
+        await Capture("default-demo", 270, 160); CheckQuotaLayout(WidgetLayout.Standard);
+        await Capture("minimum-demo", 220, 130); CheckQuotaLayout(WidgetLayout.Compact);
+        await Capture("threshold-compact-demo", 270, 149); CheckQuotaLayout(WidgetLayout.Compact);
+        await Capture("threshold-full-demo", 270, 150); CheckQuotaLayout(WidgetLayout.Standard);
+        await Capture("expanded-demo", 380, 300); CheckQuotaLayout(WidgetLayout.Expanded);
+        await Capture("expanded-boundary-demo", 340, 260); CheckQuotaLayout(WidgetLayout.Expanded);
+        await Capture("narrow-tall-demo", 220, 300); CheckQuotaLayout(WidgetLayout.Standard);
+        await Capture("wide-short-demo", 400, 130); CheckQuotaLayout(WidgetLayout.Compact);
+        await Capture("restored-demo", 270, 160); CheckQuotaLayout(WidgetLayout.Standard);
+        hadError = true; schedule.Failed(now.AddMinutes(1)); UpdateTimeLabels();
+        await Capture("expanded-error-demo", 380, 300);
+        if (!footer.Text.Contains("이전 조회 결과")) throw new Exception("Stale data status missing");
+        hadError = false; UpdateTimeLabels();
+        snapshot = new UsageSnapshot(new List<LimitWindow> { new("주간 한도", 31, now.AddDays(5).AddHours(2).AddSeconds(30).ToUnixTimeSeconds()) }, "demo", now);
+        RenderSnapshot(snapshot);
+        await Capture("weekly-only-demo", 270, 160); CheckQuotaLayout(WidgetLayout.Standard);
+        if (rows.Children.OfType<Grid>().Count() != 1) throw new Exception("Missing daily quota must not be fabricated");
+        snapshot = snapshot with { Windows = new List<LimitWindow> { new("일간 한도", 28, now.AddHours(2).AddMinutes(18).ToUnixTimeSeconds()), new("주간 한도", 31, now.AddDays(5).AddHours(2).AddSeconds(30).ToUnixTimeSeconds()) } };
+        RenderSnapshot(snapshot);
         TogglePin(); if (!Topmost) throw new Exception("Pin did not enable Topmost");
         TogglePin(); if (Topmost) throw new Exception("Pin did not disable Topmost");
         ApplyTransparency(80);
         if (((SolidColorBrush)surface.Background).Color.A != 51) throw new Exception("Opacity mismatch");
-        await Capture("expanded-transparent-demo", 380, 235);
-        File.WriteAllText(System.IO.Path.Combine(folder, "ui-check.json"), "{\"pinToggle\":true,\"transparency80\":true,\"sizesRendered\":6,\"quotaBarsAlwaysVisible\":true,\"responsiveLabels\":true}");
+        await Capture("expanded-transparent-demo", 380, 300); CheckQuotaLayout(WidgetLayout.Expanded);
+        File.WriteAllText(System.IO.Path.Combine(folder, "ui-check.json"), JsonSerializer.Serialize(new { pinToggle = true, transparency80 = true, sizesRendered = rendered, essentialLabelsAlwaysVisible = true, expandedDetails = true, staleDataStatus = true, singleQuotaSupported = true }));
         Close();
     }
     [StructLayout(LayoutKind.Sequential)] private struct RECT { public int Left, Top, Right, Bottom; }
