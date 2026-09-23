@@ -74,10 +74,12 @@ public sealed class WidgetWindow : Window
     private readonly TextBlock state;
     private readonly Button refreshButton;
     private readonly Button pinButton;
+    private readonly Button helpButton;
     private readonly List<(LimitWindow Window, TextBlock Text)> resetLabels = new();
     private readonly Forms.NotifyIcon? tray;
     private UsageSnapshot? snapshot;
     private SettingsWindow? settingsWindow;
+    private HelpWindow? helpWindow;
     private bool busy;
     private bool closed;
     private bool hadError;
@@ -124,6 +126,9 @@ public sealed class WidgetWindow : Window
         refreshButton = IconButton("\uE72C", "지금 새로고침", async (_, _) => await RefreshAsync());
         controls.Children.Add(pinButton); controls.Children.Add(refreshButton);
         controls.Children.Add(IconButton("\uE713", "설정", (_, _) => OpenSettings()));
+        helpButton = IconButton("?", "도움말 (F1)", (_, _) => OpenHelp());
+        helpButton.FontFamily = FontFamily; helpButton.FontSize = 14; helpButton.FontWeight = FontWeights.SemiBold;
+        controls.Children.Add(helpButton);
         controls.Children.Add(IconButton("\uE921", "트레이로 숨기기", (_, _) => Hide()));
         Grid.SetColumn(controls, 1); header.Children.Add(controls); layout.Children.Add(header);
         scroller = new ScrollViewer { Content = rows, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled, Margin = new Thickness(0, 4, 0, 0) };
@@ -144,6 +149,7 @@ public sealed class WidgetWindow : Window
             menu.Items.Add("지금 새로고침", null, (_, _) => Dispatcher.InvokeAsync(async () => await RefreshAsync()));
             menu.Items.Add("최상단 고정 / 해제", null, (_, _) => Dispatcher.Invoke(TogglePin));
             menu.Items.Add("설정", null, (_, _) => Dispatcher.Invoke(OpenSettings));
+            menu.Items.Add("도움말", null, (_, _) => Dispatcher.Invoke(OpenHelp));
             menu.Items.Add(new Forms.ToolStripSeparator());
             menu.Items.Add("종료", null, (_, _) => Dispatcher.Invoke(Close));
             tray.ContextMenuStrip = menu;
@@ -155,6 +161,7 @@ public sealed class WidgetWindow : Window
         LocationChanged += (_, _) => QueueSave(); SizeChanged += (_, _) =>
         {
             QueueSave();
+            brandLabel.Text = ActualWidth < 245 ? "Codex" : "Codex Peek";
             if (snapshot is not null && (layoutMode != SelectLayout() || (expandedMode && Math.Abs(contentScale - ExpandedScale()) > 0.02))) RenderSnapshot(snapshot);
             else if (IsLoaded) UpdateFooterVisibility();
         };
@@ -177,9 +184,10 @@ public sealed class WidgetWindow : Window
         {
             closed = true; timer.Stop(); saveTimer.Stop(); lifetime.Cancel();
             SystemEvents.PowerModeChanged -= PowerChanged;
-            settingsWindow?.Close(); tray?.Dispose(); SaveSettings();
+            settingsWindow?.Close(); helpWindow?.Close(); tray?.Dispose(); SaveSettings();
         };
-        PreviewKeyDown += async (_, e) => { if (e.Key == Key.F5) { e.Handled = true; await RefreshAsync(); } };
+        PreviewKeyDown += async (_, e) => { if (e.Key == Key.F1) { e.Handled = true; OpenHelp(); }
+            else if (e.Key == Key.F5) { e.Handled = true; await RefreshAsync(); } };
     }
     internal static TextBlock Label(string text, double size = 12, Color? color = null, FontWeight? weight = null) => new() { Text = text, FontSize = size, Foreground = new SolidColorBrush(color ?? Ink), FontWeight = weight ?? FontWeights.Normal, VerticalAlignment = VerticalAlignment.Center };
     private static Button IconButton(string symbol, string tooltip, RoutedEventHandler click)
@@ -362,6 +370,14 @@ public sealed class WidgetWindow : Window
         settingsWindow.Closed += (_, _) => { settingsWindow = null; ApplyTransparency(settings.Transparency); };
         settingsWindow.Show();
     }
+    private void OpenHelp()
+    {
+        if (helpWindow is not null) { if (helpWindow.WindowState == WindowState.Minimized) helpWindow.WindowState = WindowState.Normal; helpWindow.Activate(); return; }
+        ShowWidget();
+        helpWindow = new HelpWindow { Owner = this };
+        helpWindow.Closed += (_, _) => helpWindow = null;
+        helpWindow.Show();
+    }
     private void SaveOptions(int minutes, int transparency, bool startup, string? path)
     {
         using var key = Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run");
@@ -470,7 +486,14 @@ public sealed class WidgetWindow : Window
         ApplyTransparency(80);
         if (((SolidColorBrush)surface.Background).Color.A != 51) throw new Exception("Opacity mismatch");
         await Capture("expanded-transparent-demo", 380, 300); CheckQuotaLayout(WidgetLayout.Expanded);
-        File.WriteAllText(System.IO.Path.Combine(folder, "ui-check.json"), JsonSerializer.Serialize(new { pinToggle = true, transparency80 = true, sizesRendered = rendered, essentialLabelsAlwaysVisible = true, expandedDetails = true, staleDataStatus = true, singleQuotaSupported = true, proportionalTypography = true, groupedStatus = true, compactHeightFitsContent = true }));
+        helpButton.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+        var openedHelp = helpWindow ?? throw new Exception("Help button did not open a window");
+        helpButton.RaiseEvent(new RoutedEventArgs(Button.ClickEvent));
+        if (!ReferenceEquals(openedHelp, helpWindow)) throw new Exception("Help windows were duplicated");
+        await openedHelp.VerifyPagesAsync(folder);
+        openedHelp.Close();
+        if (helpWindow is not null) throw new Exception("Help window reference was not released");
+        File.WriteAllText(System.IO.Path.Combine(folder, "ui-check.json"), JsonSerializer.Serialize(new { pinToggle = true, transparency80 = true, sizesRendered = rendered, essentialLabelsAlwaysVisible = true, expandedDetails = true, staleDataStatus = true, singleQuotaSupported = true, proportionalTypography = true, groupedStatus = true, compactHeightFitsContent = true, helpWindow = true, helpTopicsRendered = 3 }));
         Close();
     }
     [StructLayout(LayoutKind.Sequential)] private struct RECT { public int Left, Top, Right, Bottom; }
