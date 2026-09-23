@@ -84,6 +84,7 @@ public sealed class UserSettings
     public bool Pinned { get; set; }
     public bool StartWithWindows { get; set; }
     public string? CodexPath { get; set; }
+    public bool ShowServices { get; set; } = true;
     public void Normalize()
     {
         IntervalMinutes = Math.Clamp(IntervalMinutes, 1, 1440);

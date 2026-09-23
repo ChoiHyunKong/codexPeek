@@ -15,3 +15,7 @@ settings.json
 # Local diagnostics and real account usage
 /artifacts/*.json
 *.log
+client_secret*.json
+credentials*.json
+*-credentials.bin
+claude-usage.json

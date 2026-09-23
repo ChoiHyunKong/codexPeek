@@ -26,6 +26,12 @@ public sealed class App : Application
     private Mutex? mutex;
     [STAThread] public static void Main(string[] args)
     {
+        if (args.Length > 0 && args[0] == "--claude-statusline")
+        {
+            try { ClaudeBridge.Capture(Console.In.ReadToEnd()); Console.WriteLine("Claude · Codex Peek 연결됨"); }
+            catch { Console.WriteLine("Claude · 한도 전달 대기"); }
+            return;
+        }
         if (args.Length > 0 && args[0] == "--probe")
         {
             try
@@ -48,7 +54,7 @@ public sealed class App : Application
     }
 }
 
-public sealed class WidgetWindow : Window
+public sealed partial class WidgetWindow : Window
 {
     private static readonly Color Ink = Color.FromRgb(29, 43, 39);
     private static readonly Color Green = Color.FromRgb(37, 121, 94);
@@ -69,7 +75,7 @@ public sealed class WidgetWindow : Window
     private double contentScale = 1;
     private bool fittingCompactHeight;
     private bool hasRenderedSnapshot;
-    private double ExpandedScale() => Math.Clamp(Math.Min(ActualWidth / 340.0, ActualHeight / 260.0), 1, 2.5);
+    private double ExpandedScale() => Math.Clamp(Math.Min(ActualWidth / 340.0, ActualHeight / 260.0), 1, dashboardMode ? 1.4 : 2.5);
     private readonly RowDefinition footerRow = new() { Height = new GridLength(20) };
     private readonly TextBlock state;
     private readonly Button refreshButton;
@@ -87,7 +93,7 @@ public sealed class WidgetWindow : Window
     private WidgetLayout layoutMode;
     private bool compactMode => layoutMode == WidgetLayout.Compact;
     private bool expandedMode => layoutMode == WidgetLayout.Expanded;
-    private WidgetLayout SelectLayout() => ActualWidth >= 340 && ActualHeight >= 260
+    private WidgetLayout SelectLayout() => ActualHeight >= 260
         ? WidgetLayout.Expanded : ActualHeight < 150 ? WidgetLayout.Compact : WidgetLayout.Standard;
     private readonly string? verifyFolder;
 
@@ -113,6 +119,9 @@ public sealed class WidgetWindow : Window
         layout.RowDefinitions.Add(headerRow);
         layout.RowDefinitions.Add(quotaRow);
         layout.RowDefinitions.Add(footerRow);
+        layout.RowDefinitions.Add(serviceRow);
+        serviceScroll.Content = services;
+        Grid.SetRow(serviceScroll, 3); layout.Children.Add(serviceScroll);
 
         var header = new Grid { Background = Brushes.Transparent };
         header.ColumnDefinitions.Add(new ColumnDefinition()); header.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
@@ -149,6 +158,7 @@ public sealed class WidgetWindow : Window
             menu.Items.Add("지금 새로고침", null, (_, _) => Dispatcher.InvokeAsync(async () => await RefreshAsync()));
             menu.Items.Add("최상단 고정 / 해제", null, (_, _) => Dispatcher.Invoke(TogglePin));
             menu.Items.Add("설정", null, (_, _) => Dispatcher.Invoke(OpenSettings));
+            menu.Items.Add("이메일 · AI 연결", null, (_, _) => Dispatcher.Invoke(OpenConnections));
             menu.Items.Add("도움말", null, (_, _) => Dispatcher.Invoke(OpenHelp));
             menu.Items.Add(new Forms.ToolStripSeparator());
             menu.Items.Add("종료", null, (_, _) => Dispatcher.Invoke(Close));
@@ -156,14 +166,18 @@ public sealed class WidgetWindow : Window
             tray.DoubleClick += (_, _) => Dispatcher.Invoke(ShowWidget);
             SystemEvents.PowerModeChanged += PowerChanged;
         }
-        timer.Tick += async (_, _) => { UpdateTimeLabels(); if (schedule.IsDue(DateTimeOffset.Now)) await RefreshAsync(); };
+        timer.Tick += async (_, _) =>
+        {
+            UpdateTimeLabels();
+            if (DateTimeOffset.Now >= nextServicesUpdate) _ = RefreshServicesAsync();
+            if (schedule.IsDue(DateTimeOffset.Now)) await RefreshAsync();
+        };
         saveTimer.Tick += (_, _) => { saveTimer.Stop(); SaveSettings(); };
         LocationChanged += (_, _) => QueueSave(); SizeChanged += (_, _) =>
         {
             QueueSave();
             brandLabel.Text = ActualWidth < 245 ? "Codex" : "Codex Peek";
-            if (snapshot is not null && (layoutMode != SelectLayout() || (expandedMode && Math.Abs(contentScale - ExpandedScale()) > 0.02))) RenderSnapshot(snapshot);
-            else if (IsLoaded) UpdateFooterVisibility();
+            if (IsLoaded && !fittingCompactHeight) RenderSnapshot(snapshot);
         };
         Loaded += async (_, _) =>
         {
@@ -178,13 +192,13 @@ public sealed class WidgetWindow : Window
                 }
                 return;
             }
-            timer.Start(); await RefreshAsync();
+            RenderSnapshot(snapshot); timer.Start(); await RefreshAsync();
         };
         Closed += (_, _) =>
         {
             closed = true; timer.Stop(); saveTimer.Stop(); lifetime.Cancel();
             SystemEvents.PowerModeChanged -= PowerChanged;
-            settingsWindow?.Close(); helpWindow?.Close(); tray?.Dispose(); SaveSettings();
+            settingsWindow?.Close(); helpWindow?.Close(); connectionsWindow?.Close(); tray?.Dispose(); SaveSettings();
         };
         PreviewKeyDown += async (_, e) => { if (e.Key == Key.F1) { e.Handled = true; OpenHelp(); }
             else if (e.Key == Key.F5) { e.Handled = true; await RefreshAsync(); } };
@@ -223,6 +237,7 @@ public sealed class WidgetWindow : Window
     }
     private async Task RefreshAsync()
     {
+        _ = RefreshServicesAsync();
         if (busy || closed) return;
         busy = true; refreshButton.IsEnabled = false; footer.Text = "최신 사용량을 조회하고 있습니다…"; UpdateFooterVisibility();
         try
@@ -240,7 +255,7 @@ public sealed class WidgetWindow : Window
             hadError = true; schedule.Failed(DateTimeOffset.Now);
             var message = ex is InvalidOperationException ? ex.Message : "사용량을 가져오지 못했습니다. Codex 설치와 네트워크를 확인하세요.";
             footer.ToolTip = message;
-            if (snapshot is null) { rows.Children.Clear(); state.Text = message; rows.Children.Add(state); }
+            if (snapshot is null) { state.Text = message; RenderSnapshot(null); }
         }
         finally { busy = false; refreshButton.IsEnabled = true; if (!closed) UpdateTimeLabels(); }
     }
@@ -250,16 +265,17 @@ public sealed class WidgetWindow : Window
         try { return "리셋 " + DateTimeOffset.FromUnixTimeSeconds(epoch).ToLocalTime().ToString("yyyy.MM.dd (ddd) HH:mm", CultureInfo.GetCultureInfo("ko-KR")); }
         catch (ArgumentOutOfRangeException) { return "정확한 리셋 시각 정보 없음"; }
     }
-    private void RenderSnapshot(UsageSnapshot data)
+    private void RenderSnapshot(UsageSnapshot? data)
     {
         bool fitRestoredMinimum = !hasRenderedSnapshot && ActualHeight <= 130;
-        hasRenderedSnapshot = true;
+        if (data is not null) hasRenderedSnapshot = true;
         rows.Children.Clear(); resetLabels.Clear(); layoutMode = SelectLayout();
         contentScale = expandedMode ? ExpandedScale() : 1;
         brandLabel.FontSize = expandedMode ? 14 * contentScale : 13;
         headerRow.Height = new GridLength(expandedMode ? 28 * contentScale : 26);
-        if (data.Windows.Count == 0) { state.Text = "계정에서 표시 가능한 한도 정보를 제공하지 않았습니다."; rows.Children.Add(state); }
-        foreach (var w in data.Windows)
+        if (data is null) rows.Children.Add(state);
+        else if (data.Windows.Count == 0) { state.Text = "계정에서 표시 가능한 한도 정보를 제공하지 않았습니다."; rows.Children.Add(state); }
+        foreach (var w in data?.Windows ?? new List<LimitWindow>())
         {
             var box = new Grid { Margin = new Thickness(0, 1, 2, expandedMode ? 5 * contentScale : 1) };
             box.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
@@ -276,7 +292,7 @@ public sealed class WidgetWindow : Window
             var track = new Grid { Name = "QuotaBar", Height = expandedMode ? 6 * contentScale : 6, VerticalAlignment = VerticalAlignment.Center, ClipToBounds = true, Background = Brushes.Transparent };
             System.Windows.Automation.AutomationProperties.SetName(track, $"{w.Name}, {w.Remaining:0.#}% 남음");
             track.ToolTip = "";
-            track.ToolTipOpening += (_, _) => track.ToolTip = $"{w.Name} · {w.Remaining:0.#}% 남음\n{w.ResetText(DateTimeOffset.Now)}\n{AbsoluteReset(w)}\n최근 갱신 {data.FetchedAt:MM/dd HH:mm}";
+            track.ToolTipOpening += (_, _) => track.ToolTip = $"{w.Name} · {w.Remaining:0.#}% 남음\n{w.ResetText(DateTimeOffset.Now)}\n{AbsoluteReset(w)}\n최근 갱신 {data!.FetchedAt:MM/dd HH:mm}";
             track.Children.Add(new Border { Background = new SolidColorBrush(Color.FromArgb(50, 82, 127, 106)), CornerRadius = new CornerRadius(3) });
             var fill = new Border { Background = new SolidColorBrush(w.Remaining <= 10 ? Color.FromRgb(185, 78, 55) : Green), CornerRadius = new CornerRadius(3), HorizontalAlignment = HorizontalAlignment.Left };
             track.SizeChanged += (_, _) => fill.Width = track.ActualWidth * w.Remaining / 100;
@@ -294,6 +310,7 @@ public sealed class WidgetWindow : Window
         }
         if (!hadError) footer.ToolTip = null;
         UpdateTimeLabels();
+        RenderServiceCards();
         if (fitRestoredMinimum && compactMode) Height = MinHeight;
     }
     private void UpdateFooterVisibility()
@@ -310,7 +327,7 @@ public sealed class WidgetWindow : Window
         {
             // Group status directly below the quota cards; keep overflow scrollable.
             footer.Measure(new Size(Math.Max(1, ActualWidth - 28), double.PositiveInfinity));
-            scroller.MaxHeight = Math.Max(35, ActualHeight - 19 - headerRow.Height.Value - footer.DesiredSize.Height - 4);
+            scroller.MaxHeight = Math.Max(35, ActualHeight - 19 - headerRow.Height.Value - footer.DesiredSize.Height - 4 - (dashboardMode ? 105 : 0));
         }
         else scroller.MaxHeight = double.PositiveInfinity;
         UpdateCompactMinimum();
@@ -334,6 +351,7 @@ public sealed class WidgetWindow : Window
     {
         var now = DateTimeOffset.Now;
         foreach (var (w, text) in resetLabels) text.Text = w.ResetText(now);
+        foreach (var (w, text) in serviceResetLabels) text.Text = w.ResetText(now);
         if (busy) { footer.Text = "최신 사용량을 조회하고 있습니다…"; UpdateFooterVisibility(); return; }
         if (hadError)
         {
@@ -366,7 +384,7 @@ public sealed class WidgetWindow : Window
     {
         if (settingsWindow is not null) { settingsWindow.Activate(); return; }
         ShowWidget();
-        settingsWindow = new SettingsWindow(settings, ApplyTransparency, SaveOptions) { Owner = this };
+        settingsWindow = new SettingsWindow(settings, ApplyTransparency, SaveOptions, OpenConnections) { Owner = this };
         settingsWindow.Closed += (_, _) => { settingsWindow = null; ApplyTransparency(settings.Transparency); };
         settingsWindow.Show();
     }
@@ -384,6 +402,7 @@ public sealed class WidgetWindow : Window
         if (startup) key.SetValue("CodexPeek", $"\"{Environment.ProcessPath}\""); else key.DeleteValue("CodexPeek", false);
         settings.IntervalMinutes = minutes; settings.Transparency = transparency; settings.StartWithWindows = startup; settings.CodexPath = path;
         schedule.Configure(minutes, DateTimeOffset.Now); ApplyTransparency(transparency); SaveSettings(); UpdateTimeLabels();
+        nextServicesUpdate = DateTimeOffset.Now;
         if (schedule.IsDue(DateTimeOffset.Now)) _ = RefreshAsync();
     }
     private void AddResizeHandles(Grid grid)
@@ -459,9 +478,24 @@ public sealed class WidgetWindow : Window
         await Capture("expanded-demo", 380, 300); CheckQuotaLayout(WidgetLayout.Expanded);
         await Capture("expanded-boundary-demo", 340, 260); CheckQuotaLayout(WidgetLayout.Expanded);
         await Capture("large-demo", 640, 480); CheckQuotaLayout(WidgetLayout.Expanded);
-        if (footer.FontSize < 20) throw new Exception("Text did not scale with the window");
+        if (footer.FontSize < 16) throw new Exception("Text did not scale with the window");
         await Capture("extra-large-demo", 900, 620); CheckQuotaLayout(WidgetLayout.Expanded);
-        await Capture("narrow-tall-demo", 220, 300); CheckQuotaLayout(WidgetLayout.Standard);
+        await Capture("narrow-tall-demo", 220, 300); CheckQuotaLayout(WidgetLayout.Expanded);
+        await Capture("narrow-dashboard-demo", 220, 650); CheckQuotaLayout(WidgetLayout.Expanded);
+        if (!serviceScroll.IsVisible || serviceScroll.ViewportHeight < 100 || services.Children.Count < 3) throw new Exception("Narrow dashboard missing service cards");
+        if (serviceScroll.ScrollableWidth > 0) throw new Exception("Service cards overflow horizontally");
+        serviceScroll.ScrollToBottom(); await Capture("narrow-dashboard-bottom-demo", 220, 650); serviceScroll.ScrollToTop();
+        mail = new MailSnapshot("demo@example.com", 12, new() { new("이번 주 프로젝트 진행 상황 공유", "디자인 팀"), new("회의 일정 확인", "프로젝트 팀"), new("새로운 업데이트 안내", "서비스 안내") }, now);
+        claude = new ClaudeSnapshot(new() { new("5시간 한도", 20, now.AddHours(3).ToUnixTimeSeconds()), new("주간 한도", 45, now.AddDays(4).ToUnixTimeSeconds()) }, now);
+        RenderServiceCards(); await Capture("connected-dashboard-demo", 380, 760);
+        serviceScroll.ScrollToBottom(); await Capture("connected-dashboard-bottom-demo", 220, 650); serviceScroll.ScrollToTop();
+        await Capture("dashboard-boundary-demo", 220, 360);
+        if (!serviceScroll.IsVisible || serviceScroll.ViewportHeight < 100 || serviceScroll.ScrollableWidth > 0) throw new Exception("Dashboard threshold lost accessible cards");
+        var savedSnapshot = snapshot; snapshot = null; hadError = true; state.Text = "Codex 로그인 필요"; RenderSnapshot(null);
+        await Capture("dashboard-codex-offline-demo", 220, 500);
+        if (!serviceScroll.IsVisible || services.Children.Count < 3) throw new Exception("Codex failure hid other services");
+        snapshot = savedSnapshot; hadError = false; RenderSnapshot(snapshot);
+        mail = null; claude = null;
         await Capture("wide-short-demo", 400, 130); CheckQuotaLayout(WidgetLayout.Compact);
         await Capture("restored-demo", 270, 160); CheckQuotaLayout(WidgetLayout.Standard);
         hadError = true; schedule.Failed(now.AddMinutes(1)); UpdateTimeLabels();
@@ -493,7 +527,24 @@ public sealed class WidgetWindow : Window
         await openedHelp.VerifyPagesAsync(folder);
         openedHelp.Close();
         if (helpWindow is not null) throw new Exception("Help window reference was not released");
-        File.WriteAllText(System.IO.Path.Combine(folder, "ui-check.json"), JsonSerializer.Serialize(new { pinToggle = true, transparency80 = true, sizesRendered = rendered, essentialLabelsAlwaysVisible = true, expandedDetails = true, staleDataStatus = true, singleQuotaSupported = true, proportionalTypography = true, groupedStatus = true, compactHeightFitsContent = true, helpWindow = true, helpTopicsRendered = 3 }));
+        OpenConnections();
+        await Dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle);
+        var connectionContent = (FrameworkElement)connectionsWindow!.Content;
+        connectionContent.UpdateLayout();
+        if (((ScrollViewer)connectionContent).ScrollableWidth > 0) throw new Exception("Connections window horizontal overflow");
+        var connectionBitmap = new RenderTargetBitmap((int)Math.Ceiling(connectionContent.ActualWidth * 1.5), (int)Math.Ceiling(connectionContent.ActualHeight * 1.5), 144, 144, PixelFormats.Pbgra32);
+        var connectionVisual = new DrawingVisual();
+        using (var drawing = connectionVisual.RenderOpen())
+        {
+            var bounds = new Rect(0, 0, connectionContent.ActualWidth, connectionContent.ActualHeight);
+            drawing.DrawRectangle(connectionsWindow.Background, null, bounds);
+            drawing.DrawRectangle(new VisualBrush(connectionContent), null, bounds);
+        }
+        connectionBitmap.Render(connectionVisual);
+        var connectionEncoder = new PngBitmapEncoder(); connectionEncoder.Frames.Add(BitmapFrame.Create(connectionBitmap));
+        using (var output = File.Create(System.IO.Path.Combine(folder, "connections-demo.png"))) connectionEncoder.Save(output);
+        connectionsWindow.Close();
+        File.WriteAllText(System.IO.Path.Combine(folder, "ui-check.json"), JsonSerializer.Serialize(new { pinToggle = true, transparency80 = true, sizesRendered = rendered, essentialLabelsAlwaysVisible = true, expandedDetails = true, staleDataStatus = true, singleQuotaSupported = true, proportionalTypography = true, groupedStatus = true, compactHeightFitsContent = true, helpWindow = true, helpTopicsRendered = 3, narrowDashboard = true, independentServiceVisibility = true, connectionsWindow = true }));
         Close();
     }
     [StructLayout(LayoutKind.Sequential)] private struct RECT { public int Left, Top, Right, Bottom; }
@@ -504,13 +555,15 @@ public sealed class WidgetWindow : Window
 
 public sealed class SettingsWindow : Window
 {
-    public SettingsWindow(UserSettings settings, Action<int> previewTransparency, Action<int, int, bool, string?> save)
+    public SettingsWindow(UserSettings settings, Action<int> previewTransparency, Action<int, int, bool, string?> save, Action connections)
     {
         Title = "Codex Peek 설정"; Width = 365; SizeToContent = SizeToContent.Height; ResizeMode = ResizeMode.NoResize;
         WindowStartupLocation = WindowStartupLocation.CenterOwner; Background = new SolidColorBrush(Color.FromRgb(246, 249, 243));
         FontFamily = new FontFamily("Segoe UI, Malgun Gothic"); FontSize = 12;
         var stack = new StackPanel { Margin = new Thickness(22) }; Content = stack;
         stack.Children.Add(WidgetWindow.Label("나에게 맞는 작은 창", 19, weight: FontWeights.SemiBold));
+        var servicesButton = new Button { Content = "이메일 · AI 연결 관리", Padding = new Thickness(8), Margin = new Thickness(0, 10, 0, 0) };
+        servicesButton.Click += (_, _) => connections(); stack.Children.Add(servicesButton);
         stack.Children.Add(new TextBlock { Text = "사용량은 설정한 간격과 새로고침으로 갱신합니다.", FontSize = 11, Margin = new Thickness(0, 7, 0, 19) });
         stack.Children.Add(WidgetWindow.Label("자동 업데이트 간격 · 분"));
         var interval = new TextBox { Text = settings.IntervalMinutes.ToString(), Margin = new Thickness(0, 6, 0, 3), Padding = new Thickness(7), MaxLength = 4 };

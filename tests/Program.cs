@@ -65,4 +65,5 @@ try
     catch (OperationCanceledException) { Check(true, "cancellation terminates pending process"); }
 }
 finally { Environment.SetEnvironmentVariable("CODEX_PEEK_TEST_MODE", null); }
+await ServiceTests.Run(Check);
 Console.WriteLine($"All {passed} checks passed.");
